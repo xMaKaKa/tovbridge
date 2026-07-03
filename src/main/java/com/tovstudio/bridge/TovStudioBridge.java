@@ -3,6 +3,7 @@ package com.tovstudio.bridge;
 
 import com.google.gson.Gson;
 import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import org.bukkit.Bukkit;
@@ -17,20 +18,16 @@ import org.bukkit.plugin.java.JavaPlugin;
 
 import java.net.URI;
 import java.net.http.HttpClient;
-import java.net.http.WebSocket;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionStage;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
 
 public class TovStudioBridge extends JavaPlugin implements Listener {
 
     private final Gson gson = new Gson();
     private HttpClient http;
-    private volatile WebSocket ws;
-    private volatile boolean shuttingDown = false;
-    private volatile boolean welcomed = false;
-    private CompletableFuture<WebSocket> sendChain;
 
-    private String panelUrl;
+    private String base;
     private String token;
     private String serverId;
     private int reportInterval;
@@ -38,97 +35,85 @@ public class TovStudioBridge extends JavaPlugin implements Listener {
     @Override
     public void onEnable() {
         saveDefaultConfig();
-        panelUrl = getConfig().getString("panel-url", "ws://127.0.0.1:30002/bridge");
+        base = getConfig().getString("panel-url", "http://127.0.0.1:30001");
+        if (base.endsWith("/")) base = base.substring(0, base.length() - 1);
         token = getConfig().getString("server-token", "");
         serverId = getConfig().getString("server-id", "1");
         reportInterval = Math.max(2, getConfig().getInt("report-interval-seconds", 5));
 
-        http = HttpClient.newHttpClient();
+        http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(8)).build();
         Bukkit.getPluginManager().registerEvents(this, this);
-        connect();
 
-        long ticks = reportInterval * 20L;
-        Bukkit.getScheduler().runTaskTimer(this, this::report, ticks, ticks);
+        Bukkit.getScheduler().runTaskTimer(this, this::report, 60L, reportInterval * 20L);
+        Bukkit.getScheduler().runTaskTimerAsynchronously(this, this::poll, 40L, 30L);
 
-        getLogger().info("TovStudioBridge enabled. Panel: " + panelUrl);
+        getLogger().info("TovStudioBridge enabled (HTTP). Panel: " + base);
     }
 
-    @Override
-    public void onDisable() {
-        shuttingDown = true;
-        WebSocket w = ws;
-        if (w != null) {
-            try { w.sendClose(WebSocket.NORMAL_CLOSURE, "shutdown"); } catch (Exception ignored) {}
-        }
+    private JsonObject baseMsg() {
+        JsonObject o = new JsonObject();
+        o.addProperty("token", token);
+        o.addProperty("server_id", serverId);
+        o.addProperty("version", getServer().getVersion());
+        o.addProperty("name", getServer().getName());
+        return o;
     }
 
-    private void connect() {
-        if (shuttingDown) return;
-        welcomed = false;
+    private void postAsync(String path, JsonObject body) {
+        HttpRequest req = HttpRequest.newBuilder()
+            .uri(URI.create(base + path))
+            .header("Content-Type", "application/json")
+            .timeout(Duration.ofSeconds(8))
+            .POST(HttpRequest.BodyPublishers.ofString(gson.toJson(body)))
+            .build();
+        http.sendAsync(req, HttpResponse.BodyHandlers.ofString()).exceptionally(ex -> null);
+    }
+
+    private void poll() {
+        JsonObject body = baseMsg();
+        HttpRequest req = HttpRequest.newBuilder()
+            .uri(URI.create(base + "/bridge/poll"))
+            .header("Content-Type", "application/json")
+            .timeout(Duration.ofSeconds(8))
+            .POST(HttpRequest.BodyPublishers.ofString(gson.toJson(body)))
+            .build();
+        http.sendAsync(req, HttpResponse.BodyHandlers.ofString())
+            .thenApply(HttpResponse::body)
+            .thenAccept(this::handlePollResponse)
+            .exceptionally(ex -> null);
+    }
+
+    private void handlePollResponse(String respBody) {
+        if (respBody == null) return;
         try {
-            http.newWebSocketBuilder()
-                .buildAsync(URI.create(panelUrl), new Handler())
-                .whenComplete((sock, err) -> {
-                    if (err != null || sock == null) {
-                        getLogger().warning("Bridge connect failed: " + (err != null ? err.getMessage() : "null"));
-                        scheduleReconnect();
-                        return;
-                    }
-                    ws = sock;
-                    sendChain = CompletableFuture.completedFuture(sock);
-                    JsonObject hello = new JsonObject();
-                    hello.addProperty("t", "hello");
-                    hello.addProperty("token", token);
-                    hello.addProperty("server_id", serverId);
-                    hello.addProperty("version", getServer().getVersion());
-                    hello.addProperty("name", getServer().getName());
-                    send(hello);
-                });
-        } catch (Exception e) {
-            getLogger().warning("Bridge error: " + e.getMessage());
-            scheduleReconnect();
-        }
-    }
-
-    private void scheduleReconnect() {
-        if (shuttingDown) return;
-        ws = null;
-        Bukkit.getScheduler().runTaskLaterAsynchronously(this, this::connect, 100L);
-    }
-
-    private synchronized void send(JsonObject obj) {
-        WebSocket w = ws;
-        if (w == null || sendChain == null) return;
-        final String text = gson.toJson(obj);
-        sendChain = sendChain.thenCompose(sock -> sock.sendText(text, true));
-        sendChain.exceptionally(ex -> null);
+            JsonObject obj = JsonParser.parseString(respBody).getAsJsonObject();
+            if (!obj.has("actions")) return;
+            JsonArray actions = obj.getAsJsonArray("actions");
+            for (JsonElement el : actions) {
+                handleAction(el.getAsJsonObject());
+            }
+        } catch (Exception ignored) {}
     }
 
     private void report() {
-        if (ws == null || !welcomed) return;
-
         JsonArray players = new JsonArray();
-        for (Player p : Bukkit.getOnlinePlayers()) {
-            players.add(playerJson(p));
-        }
-        JsonObject pmsg = new JsonObject();
+        for (Player p : Bukkit.getOnlinePlayers()) players.add(playerJson(p));
+        JsonObject pmsg = baseMsg();
         pmsg.addProperty("t", "players");
         pmsg.add("players", players);
-        send(pmsg);
+        postAsync("/bridge/push", pmsg);
 
-        JsonObject stats = new JsonObject();
+        JsonObject stats = baseMsg();
         stats.addProperty("t", "stats");
         JsonObject sp = new JsonObject();
         try { sp.addProperty("tps", Math.min(20.0, Bukkit.getServer().getTPS()[0])); } catch (Throwable ignored) {}
         try { sp.addProperty("mspt", Bukkit.getServer().getAverageTickTime()); } catch (Throwable ignored) {}
         Runtime rt = Runtime.getRuntime();
-        long used = (rt.totalMemory() - rt.freeMemory()) / 1048576L;
-        long max = rt.maxMemory() / 1048576L;
-        sp.addProperty("ram_used", used);
-        sp.addProperty("ram_max", max);
+        sp.addProperty("ram_used", (rt.totalMemory() - rt.freeMemory()) / 1048576L);
+        sp.addProperty("ram_max", rt.maxMemory() / 1048576L);
         sp.addProperty("online", Bukkit.getOnlinePlayers().size());
         stats.add("payload", sp);
-        send(stats);
+        postAsync("/bridge/push", stats);
     }
 
     private JsonObject playerJson(Player p) {
@@ -142,11 +127,11 @@ public class TovStudioBridge extends JavaPlugin implements Listener {
     }
 
     private void event(String kind, JsonObject extra) {
-        JsonObject msg = new JsonObject();
+        JsonObject msg = baseMsg();
         msg.addProperty("t", "event");
         extra.addProperty("kind", kind);
         msg.add("payload", extra);
-        send(msg);
+        postAsync("/bridge/push", msg);
     }
 
     @EventHandler
@@ -186,8 +171,7 @@ public class TovStudioBridge extends JavaPlugin implements Listener {
         final JsonObject args = msg.has("args") && msg.get("args").isJsonObject() ? msg.getAsJsonObject("args") : new JsonObject();
 
         Bukkit.getScheduler().runTask(this, () -> {
-            JsonObject result = new JsonObject();
-            result.addProperty("t", "result");
+            JsonObject result = baseMsg();
             if (id != null) result.addProperty("id", id);
             try {
                 if (action.equals("players")) {
@@ -217,46 +201,7 @@ public class TovStudioBridge extends JavaPlugin implements Listener {
                 result.addProperty("ok", false);
                 result.addProperty("error", ex.getMessage());
             }
-            send(result);
+            postAsync("/bridge/result", result);
         });
-    }
-
-    private final class Handler implements WebSocket.Listener {
-        private final StringBuilder buf = new StringBuilder();
-
-        @Override
-        public void onOpen(WebSocket webSocket) {
-            webSocket.request(1);
-        }
-
-        @Override
-        public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
-            buf.append(data);
-            webSocket.request(1);
-            if (last) {
-                String full = buf.toString();
-                buf.setLength(0);
-                try {
-                    JsonObject msg = JsonParser.parseString(full).getAsJsonObject();
-                    String t = msg.has("t") ? msg.get("t").getAsString() : "";
-                    if (t.equals("welcome")) welcomed = true;
-                    else if (t.equals("action")) handleAction(msg);
-                } catch (Exception ignored) {}
-            }
-            return null;
-        }
-
-        @Override
-        public CompletionStage<?> onClose(WebSocket webSocket, int statusCode, String reason) {
-            getLogger().warning("Bridge closed (" + statusCode + "): " + reason);
-            scheduleReconnect();
-            return null;
-        }
-
-        @Override
-        public void onError(WebSocket webSocket, Throwable error) {
-            getLogger().warning("Bridge socket error: " + error.getMessage());
-            scheduleReconnect();
-        }
     }
 }
