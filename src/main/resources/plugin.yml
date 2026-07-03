@@ -1,0 +1,7 @@
+name: TovStudioBridge
+version: 1.0.0
+main: com.tovstudio.bridge.TovStudioBridge
+api-version: "1.20"
+author: TovStudio
+description: MineRconHub companion bridge - live events and structured data over WebSocket.
+website: https://builtbybit.com/creators/tovstudio.532511/

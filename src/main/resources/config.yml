@@ -1,0 +1,7 @@
+panel-url: "ws://CHANGE-ME-PANEL-IP:30002/bridge"
+
+server-token: "CHANGE-ME-MATCH-PANEL-BRIDGE-TOKEN"
+
+server-id: "1"
+
+report-interval-seconds: 5
