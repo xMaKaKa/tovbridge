@@ -11,6 +11,7 @@ import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.AsyncPlayerChatEvent;
+import org.bukkit.event.player.PlayerCommandPreprocessEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
@@ -112,6 +113,7 @@ public class TovStudioBridge extends JavaPlugin implements Listener {
         sp.addProperty("ram_used", (rt.totalMemory() - rt.freeMemory()) / 1048576L);
         sp.addProperty("ram_max", rt.maxMemory() / 1048576L);
         sp.addProperty("online", Bukkit.getOnlinePlayers().size());
+        sp.addProperty("plugins", Bukkit.getPluginManager().getPlugins().length);
         stats.add("payload", sp);
         postAsync("/bridge/push", stats);
     }
@@ -165,6 +167,14 @@ public class TovStudioBridge extends JavaPlugin implements Listener {
         event("death", o);
     }
 
+    @EventHandler
+    public void onCommand(PlayerCommandPreprocessEvent e) {
+        JsonObject o = new JsonObject();
+        o.addProperty("name", e.getPlayer().getName());
+        o.addProperty("command", e.getMessage());
+        event("command", o);
+    }
+
     private void handleAction(JsonObject msg) {
         final String id = msg.has("id") ? msg.get("id").getAsString() : null;
         final String action = msg.has("action") ? msg.get("action").getAsString() : "";
@@ -193,6 +203,17 @@ public class TovStudioBridge extends JavaPlugin implements Listener {
                     String message = args.has("message") ? args.get("message").getAsString() : "";
                     Bukkit.broadcastMessage(message);
                     result.addProperty("ok", true);
+                } else if (action.equals("plugins")) {
+                    JsonArray arr = new JsonArray();
+                    for (org.bukkit.plugin.Plugin pl : Bukkit.getPluginManager().getPlugins()) {
+                        JsonObject po = new JsonObject();
+                        po.addProperty("name", pl.getName());
+                        po.addProperty("version", pl.getDescription().getVersion());
+                        po.addProperty("enabled", pl.isEnabled());
+                        arr.add(po);
+                    }
+                    result.addProperty("ok", true);
+                    result.add("data", arr);
                 } else {
                     result.addProperty("ok", false);
                     result.addProperty("error", "unknown action: " + action);
